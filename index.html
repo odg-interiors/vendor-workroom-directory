@@ -156,6 +156,12 @@
     text-transform:uppercase;
     color:#fff;
   }
+  .tab-multi{ display:flex; padding:0; }
+  .tab-seg{
+    flex:1 1 0; min-width:0; padding:7px 12px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .tab-seg:first-child{ padding-left:16px; }
   .card-body{ padding:16px; flex:1; display:flex; flex-direction:column; gap:8px; }
   .vendor-name{
     font-family:'Poppins', sans-serif;
@@ -202,6 +208,19 @@
   .field-row{ display:flex; gap:12px; }
   .field-row .field{ flex:1; }
   textarea{ resize:vertical; min-height:64px; font-family:'Poppins',sans-serif; }
+  .pick-group{ margin-bottom:14px; }
+  .pick-label{ font-size:12px; font-weight:600; color:var(--ink-soft); margin-bottom:6px; display:block; }
+  .pick-pills{ display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
+  .pill{
+    font-family:'Poppins', sans-serif; font-size:12px; font-weight:500;
+    padding:4px 11px; border-radius:100px; cursor:pointer;
+    border:1px solid var(--line); background:var(--surface); color:var(--ink-soft);
+  }
+  .pill:hover{ border-color:var(--ink-faint); }
+  .pill.on{ color:#fff; border-color:transparent; }
+  .pick-add{ display:flex; gap:6px; }
+  .pick-add input{ flex:1; padding:6px 10px; font-size:13px; }
+  .pick-add button{ padding:6px 12px; font-size:13px; }
   .dnu-field{ background:#FBEAEA; border:1px solid #E3B8B8; border-radius:8px; padding:10px 12px; }
   .dnu-checkbox-label{ display:flex; align-items:center; gap:8px; font-size:13px; font-weight:600; color:var(--warn); cursor:pointer; }
   .dnu-checkbox-label input{ width:16px; height:16px; accent-color:var(--warn); }
@@ -235,7 +254,7 @@
 <body>
 <div id="loginGate">
   <div class="login-card">
-    <h1 style="font-size:24px; margin:0 0 4px;">Vendor Directory</h1>
+    <h1 style="font-size:24px; margin:0 0 4px;">Vendor/Workroom Directory</h1>
     <p style="color:var(--ink-soft); font-size:14px; margin:0 0 20px;">Sign in with the team login to continue.</p>
     <div class="field">
       <label for="login-email">Email</label>
@@ -260,7 +279,7 @@
   <div class="toolbar">
     <div class="search-wrap">
       <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-      <input type="text" id="searchInput" placeholder="Search by name, contact, or notes…">
+      <input type="text" id="searchInput" placeholder="Search by name, contact, location, or notes…">
     </div>
     <button class="btn btn-ghost" id="exportBtn">Export to Excel</button>
     <button class="btn btn-primary" id="addBtn">+ Add vendor</button>
@@ -555,6 +574,9 @@
       }catch(e){ /* seeding is best-effort */ }
     }
 
+    // Upgrade older single-category / single-location vendors to lists (idempotent)
+    vendors = vendors.map(normalizeVendor);
+
     loaded = true;
     render();
   }
@@ -588,12 +610,129 @@
     "San Diego","Salt Lake City","Missoula","Kalispell","Harbor Springs","Houston","Phoenix",
     "Orange County","Georgia","Seattle","Boston","Italy","Australia"];
 
+  // ---------- Location hierarchy ----------
+  // A vendor tagged with a place automatically shows up under every broader area that
+  // contains it: e.g. "Los Angeles" is also found under Southern California, California
+  // and USA. To teach the app a new place, add a line to LOCATION_PARENTS
+  // (place -> the broader area(s) it sits inside). Places not listed here still work,
+  // they just only match themselves.
+  const LOCATION_PARENTS = {
+    // California
+    'Los Angeles': ['Southern California'],
+    'Orange County': ['Southern California'],
+    'San Diego': ['Southern California'],
+    'Santa Barbara': ['Southern California'],
+    'Palm Springs': ['Southern California'],
+    'San Francisco': ['Bay Area'],
+    'San Jose': ['Bay Area'],
+    'Oakland': ['Bay Area'],
+    'Bay Area': ['Northern California'],
+    'Sacramento': ['Northern California'],
+    'Southern California': ['California'],
+    'Northern California': ['California'],
+    'California': ['USA'],
+    // Other states and their cities
+    'Houston': ['Texas'], 'Dallas': ['Texas'], 'Austin': ['Texas'], 'San Antonio': ['Texas'],
+    'Texas': ['USA'],
+    'Missoula': ['Montana'], 'Kalispell': ['Montana'],
+    'Montana': ['USA'],
+    'Harbor Springs': ['Michigan'],
+    'Michigan': ['USA'],
+    'Salt Lake City': ['Utah'], 'Utah': ['USA'],
+    'Phoenix': ['Arizona'], 'Arizona': ['USA'],
+    'Seattle': ['Washington State'], 'Washington State': ['USA'],
+    'Atlanta': ['Georgia'], 'Georgia': ['USA'],
+    'Boston': ['Massachusetts'], 'Massachusetts': ['USA'],
+    'New York': ['New York State'], 'New York State': ['USA'],
+    // International
+    'Italy': ['Europe'],
+  };
+
+  // Alternate names. These make the search box understand "la county" or "socal",
+  // and turn them into the standard name when typed into the form.
+  const LOCATION_ALIASES = {
+    'Los Angeles': ['LA', 'L.A.', 'LA County', 'Los Angeles County', 'Greater Los Angeles'],
+    'Orange County': ['OC', 'O.C.'],
+    'San Diego': ['San Diego County'],
+    'San Francisco': ['SF', 'San Francisco County'],
+    'Bay Area': ['San Francisco Bay Area', 'SF Bay Area'],
+    'Southern California': ['SoCal', 'So Cal'],
+    'Northern California': ['NorCal', 'Nor Cal'],
+    'California': ['CA', 'Calif.'],
+    'Texas': ['TX'],
+    'New York': ['NYC', 'New York City'],
+    'USA': ['US', 'U.S.', 'U.S.A.', 'United States', 'America'],
+  };
+
+  function locKey(s){ return String(s || '').trim().toLowerCase(); }
+
+  const LOCATION_CANON = {};   // lowercased name or alias -> standard name
+  [...ALL_LOCATIONS, ...Object.keys(LOCATION_PARENTS), ...[].concat(...Object.values(LOCATION_PARENTS))]
+    .forEach(n => { LOCATION_CANON[locKey(n)] = n; });
+  Object.keys(LOCATION_ALIASES).forEach(canon => {
+    LOCATION_ALIASES[canon].forEach(a => { LOCATION_CANON[locKey(a)] = canon; });
+  });
+  const CATEGORY_CANON = {};
+  ALL_CATEGORIES.forEach(c => { CATEGORY_CANON[locKey(c)] = c; });
+
+  function canonicalLocation(text){ const t = String(text || '').trim(); return LOCATION_CANON[locKey(t)] || t; }
+  function canonicalCategory(text){ const t = String(text || '').trim(); return CATEGORY_CANON[locKey(t)] || t; }
+  function dedupeCI(arr){
+    const seen = new Set(), out = [];
+    arr.forEach(x => { const k = locKey(x); if (k && !seen.has(k)){ seen.add(k); out.push(x); } });
+    return out;
+  }
+
+  // Vendors saved before this update have a single `category` / `location` string.
+  // This upgrades them to lists on load (nothing is lost) and keeps the old single
+  // fields in sync with the first entry, so an older cached copy of the page still
+  // reads sensibly.
+  function normalizeVendor(v){
+    const rawCats = Array.isArray(v.categories) && v.categories.length ? v.categories : (v.category ? [v.category] : []);
+    const rawLocs = Array.isArray(v.locations) && v.locations.length ? v.locations : (v.location ? [v.location] : []);
+    const categories = dedupeCI(rawCats.map(c => canonicalCategory(c)));
+    const locations = dedupeCI(rawLocs.map(l => canonicalLocation(l)));
+    return { ...v, categories, locations, category: categories[0] || '', location: locations[0] || '' };
+  }
+
+  function ancestorsOf(term){
+    const out = [], seen = new Set(), queue = [...(LOCATION_PARENTS[term] || [])];
+    while (queue.length){
+      const t = queue.shift();
+      if (seen.has(t)) continue;
+      seen.add(t); out.push(t);
+      (LOCATION_PARENTS[t] || []).forEach(p => queue.push(p));
+    }
+    return out;
+  }
+  // Every area a vendor should be findable under: its own locations plus everything broader.
+  function expandedLocationTerms(v){
+    const set = new Set();
+    (v.locations || []).forEach(l => { set.add(l); ancestorsOf(l).forEach(a => set.add(a)); });
+    return [...set];
+  }
+  // Text the search box looks through for location matches (standard names + alternates).
+  function locationSearchText(v){
+    const out = [];
+    expandedLocationTerms(v).forEach(t => { out.push(t); (LOCATION_ALIASES[t] || []).forEach(a => out.push(a)); });
+    return out.join(' | ');
+  }
+
   function renderFilterBar(){
-    // Filters only show categories/locations that actually have a vendor in them —
-    // the full standard lists (ALL_CATEGORIES/ALL_LOCATIONS) are still used as
-    // autocomplete suggestions in the add/edit form, just not here.
-    const categories = uniqueSorted(vendors.map(v=>v.category));
-    const locations = uniqueSorted(vendors.map(v=>v.location));
+    // Filters only list categories/locations that at least one vendor is actually in.
+    // (The full standard lists still feed the add/edit form.)
+    const categories = uniqueSorted([].concat(...vendors.map(v => v.categories || [])));
+
+    // Places vendors are directly tagged with, plus the broader areas that contain them
+    const direct = new Set(), terms = new Set();
+    vendors.forEach(v => {
+      (v.locations || []).forEach(l => direct.add(l));
+      expandedLocationTerms(v).forEach(t => terms.add(t));
+    });
+
+    // Drop a stale filter choice (e.g. the last vendor in that category was deleted)
+    if (filters.category && !categories.includes(filters.category)) filters.category = '';
+    if (filters.location && !terms.has(filters.location)) filters.location = '';
 
     const chipsHtml = categories.map(cat => {
       const active = filters.category === cat;
@@ -609,10 +748,14 @@
       });
     });
 
-    const locSelect = el('locationSelect');
-    const currentVal = filters.location;
-    locSelect.innerHTML = '<option value="">All locations</option>' +
-      locations.map(loc => `<option value="${escapeHtml(loc)}" ${loc===currentVal?'selected':''}>${escapeHtml(loc)}</option>`).join('');
+    const places = uniqueSorted([...direct]);
+    // Broader areas, widest first (USA, then California, then Southern California...)
+    const regions = [...terms].filter(t => !direct.has(t))
+      .sort((a, b) => (ancestorsOf(a).length - ancestorsOf(b).length) || a.localeCompare(b));
+    const opt = (loc) => `<option value="${escapeHtml(loc)}" ${loc===filters.location?'selected':''}>${escapeHtml(loc)}</option>`;
+    el('locationSelect').innerHTML = '<option value="">All locations</option>' +
+      (regions.length ? `<optgroup label="Broader areas">${regions.map(opt).join('')}</optgroup>` : '') +
+      (places.length ? `<optgroup label="Places">${places.map(opt).join('')}</optgroup>` : '');
 
     el('filterBar').style.display = 'flex';
   }
@@ -620,11 +763,12 @@
   function matchesFilters(v){
     const s = filters.search.trim().toLowerCase();
     if (s){
-      const hay = [v.name, v.contactName, v.notes, v.email, v.phone].join(' ').toLowerCase();
+      const hay = [v.name, v.contactName, v.notes, v.email, v.phone,
+        (v.categories || []).join(' '), locationSearchText(v)].join(' ').toLowerCase();
       if (!hay.includes(s)) return false;
     }
-    if (filters.category && v.category !== filters.category) return false;
-    if (filters.location && v.location !== filters.location) return false;
+    if (filters.category && !(v.categories || []).includes(filters.category)) return false;
+    if (filters.location && !expandedLocationTerms(v).includes(filters.location)) return false;
     return true;
   }
 
@@ -680,16 +824,21 @@
   }
 
   function cardHtml(v){
-    const color = v.doNotUse ? 'var(--warn)' : colorForCategory(v.category || 'Uncategorized');
+    const cats = (v.categories && v.categories.length) ? v.categories : ['Uncategorized'];
     const contactBits = [v.contactName, v.phone].filter(Boolean).join(' · ');
     const priceBits = [v.priceTier, v.leadTime].filter(Boolean).join(' · ');
-    const tabLabel = v.doNotUse ? `Do Not Use · ${escapeHtml(v.category || 'Uncategorized')}` : escapeHtml(v.category || 'Uncategorized');
+    // One colored tab segment per category; flagged vendors get a single red tab instead
+    const tabHtml = v.doNotUse
+      ? `<div class="tab" style="background:var(--warn);">Do Not Use · ${escapeHtml(cats.join(', '))}</div>`
+      : `<div class="tab tab-multi">${cats.map(c =>
+          `<span class="tab-seg" title="${escapeHtml(c)}" style="background:${colorForCategory(c)};">${escapeHtml(c)}</span>`
+        ).join('')}</div>`;
     return `
       <div class="card ${v.doNotUse ? 'card-dnu' : ''}" tabindex="0" data-id="${v.id}">
-        <div class="tab" style="background:${color};">${tabLabel}</div>
+        ${tabHtml}
         <div class="card-body">
           <div class="vendor-name">${escapeHtml(v.name)}</div>
-          ${v.location ? `<div class="meta-row">${iconPin()} ${escapeHtml(v.location)}</div>` : ''}
+          ${(v.locations && v.locations.length) ? `<div class="meta-row">${iconPin()} ${escapeHtml(v.locations.join(' · '))}</div>` : ''}
           ${v.address ? `<div class="meta-row">${escapeHtml(v.address)}</div>` : ''}
           ${contactBits ? `<div class="meta-row">${iconPerson()} ${escapeHtml(contactBits)}</div>` : ''}
           ${v.website ? `<div class="meta-row">${escapeHtml(v.website)}</div>` : ''}
@@ -720,18 +869,22 @@
               <label for="f-name">Vendor name *</label>
               <input type="text" id="f-name" required value="${escapeHtml(v.name)}">
             </div>
-            <div class="field-row">
-              <div class="field">
-                <label for="f-category">Category *</label>
-                <input type="text" id="f-category" required placeholder="e.g. Catering" value="${escapeHtml(v.category)}" list="categoryList">
-              </div>
-              <div class="field">
-                <label for="f-location">Location *</label>
-                <input type="text" id="f-location" required placeholder="e.g. Austin, TX" value="${escapeHtml(v.location)}" list="locationList">
+            <div class="pick-group" id="pick-category">
+              <span class="pick-label">Categories * <span style="font-weight:400;color:var(--ink-faint);">(pick all that apply)</span></span>
+              <div class="pick-pills"></div>
+              <div class="pick-add">
+                <input type="text" class="pick-add-input" placeholder="Not listed? Type a new category">
+                <button type="button" class="btn btn-ghost pick-add-btn">Add</button>
               </div>
             </div>
-            <datalist id="categoryList">${uniqueSorted([...ALL_CATEGORIES, ...vendors.map(x=>x.category)]).map(c=>`<option value="${escapeHtml(c)}">`).join('')}</datalist>
-            <datalist id="locationList">${uniqueSorted([...ALL_LOCATIONS, ...vendors.map(x=>x.location)]).map(l=>`<option value="${escapeHtml(l)}">`).join('')}</datalist>
+            <div class="pick-group" id="pick-location">
+              <span class="pick-label">Locations * <span style="font-weight:400;color:var(--ink-faint);">(pick all that apply)</span></span>
+              <div class="pick-pills"></div>
+              <div class="pick-add">
+                <input type="text" class="pick-add-input" placeholder="Not listed? Type a new location">
+                <button type="button" class="btn btn-ghost pick-add-btn">Add</button>
+              </div>
+            </div>
             <div class="field">
               <label for="f-address">Address</label>
               <input type="text" id="f-address" value="${escapeHtml(v.address)}">
@@ -813,7 +966,61 @@
     bindModal();
   }
 
+  // Click-to-toggle pill picker used for Categories and Locations in the add/edit form.
+  // `known` = the standard options; people can also type in new ones ("add other").
+  // Values keep the order they were picked in; the first one is treated as the primary.
+  function setupPicker(rootId, known, initial, canonicalize, pillColor){
+    const root = el(rootId);
+    const pillsEl = root.querySelector('.pick-pills');
+    const input = root.querySelector('.pick-add-input');
+    const addBtn = root.querySelector('.pick-add-btn');
+    let options = uniqueSorted([...known, ...initial]);
+    let selected = [...initial];
+
+    function draw(){
+      pillsEl.innerHTML = options.map(opt => {
+        const on = selected.some(x => locKey(x) === locKey(opt));
+        const style = on ? ` style="background:${pillColor(opt)};"` : '';
+        return `<button type="button" class="pill${on ? ' on' : ''}" data-val="${escapeHtml(opt)}"${style}>${escapeHtml(opt)}</button>`;
+      }).join('');
+    }
+    pillsEl.addEventListener('click', (e) => {
+      const b = e.target.closest('.pill');
+      if (!b) return;
+      const val = b.getAttribute('data-val');
+      const i = selected.findIndex(x => locKey(x) === locKey(val));
+      if (i >= 0) selected.splice(i, 1); else selected.push(val);
+      draw();
+    });
+    function addTyped(){
+      const raw = input.value.trim();
+      if (!raw) return;
+      const canon = canonicalize(raw);                      // "LA" -> "Los Angeles", "stone" -> "Stone"
+      const existing = options.find(o => locKey(o) === locKey(canon));
+      const val = existing || canon;
+      if (!existing) options = uniqueSorted([...options, val]);
+      if (!selected.some(x => locKey(x) === locKey(val))) selected.push(val);
+      input.value = '';
+      draw();
+    }
+    addBtn.addEventListener('click', addTyped);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter'){ e.preventDefault(); addTyped(); } });
+    draw();
+    // Anything typed but not yet added still counts when the form is saved
+    return { getValues: () => { addTyped(); return [...selected]; } };
+  }
+
   function bindModal(){
+    const current = editingId ? vendors.find(x => x.id === editingId) : null;
+    const catPicker = setupPicker('pick-category',
+      ALL_CATEGORIES.concat(...vendors.map(x => x.categories || [])),
+      current ? (current.categories || []) : [],
+      canonicalCategory, colorForCategory);
+    const locPicker = setupPicker('pick-location',
+      ALL_LOCATIONS.concat(...vendors.map(x => x.locations || [])),
+      current ? (current.locations || []) : [],
+      canonicalLocation, () => '#0E2841');
+
     el('overlay').addEventListener('click', (e)=>{ if (e.target.id === 'overlay') closeModal(); });
     el('cancelBtn').addEventListener('click', closeModal);
     el('f-dnu').addEventListener('change', (e)=>{
@@ -829,10 +1036,13 @@
       }
     });
     async function handleSave(){
+      const categories = catPicker.getValues();
+      const locations = locPicker.getValues();
       const data = {
         name: el('f-name').value.trim(),
-        category: el('f-category').value.trim(),
-        location: el('f-location').value.trim(),
+        categories, locations,
+        category: categories[0] || '',   // kept in sync for older copies of the page
+        location: locations[0] || '',
         address: el('f-address').value.trim(),
         contactName: el('f-contact').value.trim(),
         phone: el('f-phone').value.trim(),
@@ -847,8 +1057,8 @@
       };
       const missing = [];
       if (!data.name) missing.push('Vendor name');
-      if (!data.category) missing.push('Category');
-      if (!data.location) missing.push('Location');
+      if (!categories.length) missing.push('Category (pick at least one)');
+      if (!locations.length) missing.push('Location (pick at least one)');
       const errBox = el('formError');
       if (missing.length){
         errBox.textContent = `Please fill in: ${missing.join(', ')}.`;
@@ -872,7 +1082,7 @@
     }
     el('submitBtn').addEventListener('click', handleSave);
     // Let Enter submit from any single-line text field, without relying on native form submission
-    el('vendorForm').querySelectorAll('input[type="text"]').forEach(input => {
+    el('vendorForm').querySelectorAll('input[type="text"]:not(.pick-add-input)').forEach(input => {
       input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter'){
           e.preventDefault();
@@ -903,11 +1113,12 @@
     ).join('');
 
     const rowsHtml = visible.map(v => {
-      const catColor = v.doNotUse ? '#FBEAEA' : (CATEGORY_COLORS[v.category] || '#F5F6F7');
-      const catText = v.doNotUse ? '#B3261E' : '#ffffff';
+      const knownColor = CATEGORY_COLORS[(v.categories || [])[0]];
+      const catColor = v.doNotUse ? '#FBEAEA' : (knownColor || '#E8E8E8');
+      const catText = v.doNotUse ? '#B3261E' : (knownColor ? '#ffffff' : '#0E2841');
       const rowBg = v.doNotUse ? '#FDF4F4' : '#ffffff';
       const cells = [
-        v.name, v.category, v.location, v.address, v.contactName, v.phone, v.email,
+        v.name, (v.categories || []).join(', '), (v.locations || []).join(', '), v.address, v.contactName, v.phone, v.email,
         v.website, v.instagram, v.priceTier, v.leadTime,
         v.doNotUse ? 'Yes' : '', v.dnuReason, v.notes,
       ];
