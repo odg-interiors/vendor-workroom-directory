@@ -213,6 +213,9 @@
   .field-row{ display:flex; gap:12px; }
   .field-row .field{ flex:1; }
   textarea{ resize:vertical; min-height:64px; font-family:'Poppins',sans-serif; }
+  .geo-row{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:12px; color:var(--ink-soft); min-height:18px; margin-top:2px; }
+  .geo-btn{ background:none; border:none; padding:0; font:inherit; font-weight:600; color:#156082; cursor:pointer; text-decoration:underline; }
+  .geo-status a{ color:#156082; }
   .pick-group{ margin-bottom:14px; }
   .pick-label{ font-size:12px; font-weight:600; color:var(--ink-soft); margin-bottom:6px; display:block; }
   .pick-pills{ display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
@@ -580,6 +583,7 @@
     }
 
     // Upgrade older single-category / single-location vendors to lists (idempotent)
+    await loadLearnedPlaces();
     vendors = vendors.map(normalizeVendor);
 
     loaded = true;
@@ -616,14 +620,25 @@
     "Orange County","Georgia","Seattle","Boston","Italy","Australia"];
 
   // ---------- Location hierarchy ----------
-  // A vendor tagged with a place automatically shows up under every broader area that
-  // contains it: e.g. "Los Angeles" is also found under Southern California, California
-  // and USA. To teach the app a new place, add a line to LOCATION_PARENTS
-  // (place -> the broader area(s) it sits inside). Places not listed here still work,
-  // they just only match themselves.
+  // Works in both directions:
+  //  - A vendor tagged with a place shows up under every broader area that contains it
+  //    (a "Los Angeles" vendor is found when filtering Southern California, California, USA).
+  //  - A vendor tagged with a broad area shows up for every place inside it
+  //    (a "California" or "USA" vendor is found when filtering Los Angeles).
+  // To teach the app a new place, add a line to LOCATION_PARENTS (place -> the broader
+  // area(s) it sits inside). Places not listed here still work, they just only match
+  // themselves.
   const LOCATION_PARENTS = {
     // California
-    'Los Angeles': ['Southern California'],
+    'Los Angeles': ['Los Angeles County'],
+    'Los Angeles County': ['Southern California'],
+    'Pasadena': ['Los Angeles County'], 'Santa Monica': ['Los Angeles County'],
+    'Beverly Hills': ['Los Angeles County'], 'West Hollywood': ['Los Angeles County'],
+    'Culver City': ['Los Angeles County'], 'Long Beach': ['Los Angeles County'],
+    'Burbank': ['Los Angeles County'], 'Glendale': ['Los Angeles County'],
+    'Malibu': ['Los Angeles County'], 'Torrance': ['Los Angeles County'],
+    'Irvine': ['Orange County'], 'Anaheim': ['Orange County'], 'Santa Ana': ['Orange County'],
+    'Newport Beach': ['Orange County'], 'Costa Mesa': ['Orange County'], 'Laguna Beach': ['Orange County'],
     'Orange County': ['Southern California'],
     'San Diego': ['Southern California'],
     'Santa Barbara': ['Southern California'],
@@ -636,6 +651,11 @@
     'Southern California': ['California'],
     'Northern California': ['California'],
     'California': ['USA'],
+    'USA': ['North America'],
+    'Canada': ['North America'],
+    'Toronto': ['Ontario'], 'Ontario': ['Canada'],
+    'Vancouver': ['British Columbia'], 'British Columbia': ['Canada'],
+    'Montreal': ['Quebec'], 'Quebec': ['Canada'],
     // Other states and their cities
     'Houston': ['Texas'], 'Dallas': ['Texas'], 'Austin': ['Texas'], 'San Antonio': ['Texas'],
     'Texas': ['USA'],
@@ -656,7 +676,8 @@
   // Alternate names. These make the search box understand "la county" or "socal",
   // and turn them into the standard name when typed into the form.
   const LOCATION_ALIASES = {
-    'Los Angeles': ['LA', 'L.A.', 'LA County', 'Los Angeles County', 'Greater Los Angeles'],
+    'Los Angeles': ['LA', 'L.A.', 'Greater Los Angeles'],
+    'Los Angeles County': ['LA County', 'L.A. County'],
     'Orange County': ['OC', 'O.C.'],
     'San Diego': ['San Diego County'],
     'San Francisco': ['SF', 'San Francisco County'],
@@ -666,7 +687,7 @@
     'California': ['CA', 'Calif.'],
     'Texas': ['TX'],
     'New York': ['NYC', 'New York City'],
-    'USA': ['US', 'U.S.', 'U.S.A.', 'United States', 'America'],
+    'USA': ['US', 'U.S.', 'U.S.A.', 'United States', 'America', 'Nationwide'],
   };
 
   function locKey(s){ return String(s || '').trim().toLowerCase(); }
@@ -700,6 +721,9 @@
     return { ...v, categories, locations, category: categories[0] || '', location: locations[0] || '' };
   }
 
+  // Terms that are a broader area of something (states, regions, countries)
+  const REGION_TERMS = new Set([].concat(...Object.values(LOCATION_PARENTS)));
+
   function ancestorsOf(term){
     const out = [], seen = new Set(), queue = [...(LOCATION_PARENTS[term] || [])];
     while (queue.length){
@@ -716,11 +740,129 @@
     (v.locations || []).forEach(l => { set.add(l); ancestorsOf(l).forEach(a => set.add(a)); });
     return [...set];
   }
+  // Does this vendor serve the given area? Yes if it is tagged with that area, with a
+  // place inside it, OR with a broader area that contains it, so a "California" or
+  // "USA" vendor is found when you look at Los Angeles.
+  function vendorCoversArea(v, term){
+    if (!term) return true;
+    if (expandedLocationTerms(v).includes(term)) return true;
+    const broader = ancestorsOf(term);
+    return (v.locations || []).some(l => broader.includes(l));
+  }
   // Text the search box looks through for location matches (standard names + alternates).
   function locationSearchText(v){
     const out = [];
     expandedLocationTerms(v).forEach(t => { out.push(t); (LOCATION_ALIASES[t] || []).forEach(a => out.push(a)); });
     return out.join(' | ');
+  }
+
+  // ---------- Smart address lookup ----------
+  // Type a street address and the app works out where it is (city -> county -> state ->
+  // country) using OpenStreetMap's free Nominatim service, then tags the vendor with the
+  // matching area from your list: an address in Torrance becomes "Los Angeles", one in
+  // Irvine becomes "Orange County". Places it hasn't seen before are remembered for the
+  // whole team (with their state/country) so they sort into the right areas from then on.
+  // If the service is unreachable nothing breaks; you just pick the location by hand.
+  const GEO_MIN_GAP_MS = 1100;   // OpenStreetMap asks for no more than one lookup per second
+
+  // Counties -> the general area your directory uses for them (keyed "county, state")
+  const COUNTY_TAGS = {};
+  [
+    ['Los Angeles', ['Los Angeles County, California']],
+    ['Orange County', ['Orange County, California']],
+    ['San Diego', ['San Diego County, California']],
+    ['San Francisco', ['San Francisco County, California', 'Alameda County, California', 'San Mateo County, California',
+                       'Santa Clara County, California', 'Marin County, California', 'Contra Costa County, California']],
+    ['New York', ['New York County, New York', 'Kings County, New York', 'Queens County, New York', 'Bronx County, New York',
+                  'Richmond County, New York', 'Nassau County, New York', 'Suffolk County, New York']],
+    ['Boston', ['Suffolk County, Massachusetts', 'Middlesex County, Massachusetts']],
+    ['Houston', ['Harris County, Texas']],
+    ['Phoenix', ['Maricopa County, Arizona']],
+    ['Salt Lake City', ['Salt Lake County, Utah']],
+    ['Seattle', ['King County, Washington']],
+    ['Missoula', ['Missoula County, Montana']],
+    ['Kalispell', ['Flathead County, Montana']],
+    ['Harbor Springs', ['Emmet County, Michigan']],
+  ].forEach(([tag, list]) => list.forEach(k => { COUNTY_TAGS[locKey(k)] = tag; }));
+  // OpenStreetMap says "Washington" / "New York" for the states; this directory keeps those names for cities
+  const STATE_NAMES = { 'new york': 'New York State', 'washington': 'Washington State' };
+
+  const geoCache = new Map();
+  let lastGeoCall = 0;
+  async function geocodeAddress(q){
+    const key = locKey(q);
+    if (geoCache.has(key)) return geoCache.get(key);
+    if (typeof fetch !== 'function') throw new Error('lookup unavailable');
+    const wait = GEO_MIN_GAP_MS - (Date.now() - lastGeoCall);
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    lastGeoCall = Date.now();
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), 8000) : null;
+    try {
+      const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&limit=1&accept-language=en&q=' + encodeURIComponent(q);
+      const res = await fetch(url, ctrl ? { signal: ctrl.signal } : undefined);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      const a = Array.isArray(data) && data[0] && data[0].address;
+      const result = a ? {
+        city: a.city || a.town || a.village || a.municipality || a.hamlet || '',
+        county: a.county || a.state_district || '',
+        state: a.state || a.region || '',
+        country: a.country || '',
+      } : null;
+      geoCache.set(key, result);          // remember answers (also what OpenStreetMap's usage policy asks)
+      return result;
+    } finally { if (timer) clearTimeout(timer); }
+  }
+
+  // Decide which tag in YOUR list an address belongs to, and what to remember about it
+  function resolveDetected(p){
+    const preferred = new Set(ALL_LOCATIONS.map(locKey));
+    vendors.forEach(v => (v.locations || []).forEach(l => preferred.add(locKey(l))));
+    const state = STATE_NAMES[locKey(p.state)] || p.state || '';
+    const country = p.country ? canonicalLocation(p.country) : '';
+    const city = p.city ? canonicalLocation(p.city) : '';
+    let tag = '';
+    if (city && preferred.has(locKey(city))) tag = city;                                            // e.g. Houston
+    else if (COUNTY_TAGS[locKey(p.county) + ', ' + locKey(p.state)]) tag = COUNTY_TAGS[locKey(p.county) + ', ' + locKey(p.state)];   // e.g. Torrance -> Los Angeles
+    else if (p.county && preferred.has(locKey(canonicalLocation(p.county)))) tag = canonicalLocation(p.county);
+    else tag = city || p.county || state || country;                                                // a place we haven't seen: tag the city itself
+    const learned = {};
+    const known = !!LOCATION_PARENTS[tag] || REGION_TERMS.has(tag);
+    if (tag && !known){
+      if (state && locKey(state) !== locKey(tag)){
+        learned[tag] = [state];
+        if (!LOCATION_PARENTS[state] && country && locKey(country) !== locKey(state)) learned[state] = [country];
+      } else if (country && locKey(country) !== locKey(tag)){
+        learned[tag] = [country];
+      }
+    }
+    const detail = [p.city, p.county, state, country].filter((x, i, arr) => x && arr.indexOf(x) === i).join(', ');
+    return { tag, learned, detail };
+  }
+
+  // Places learned from lookups, shared with the team (stored under the key "geo_parents")
+  function applyLearnedPlaces(map){
+    Object.keys(map || {}).forEach(place => {
+      const parents = (map[place] || []).filter(Boolean);
+      if (!parents.length) return;
+      if (!LOCATION_PARENTS[place]) LOCATION_PARENTS[place] = parents;
+      [place, ...parents].forEach(n => { if (!LOCATION_CANON[locKey(n)]) LOCATION_CANON[locKey(n)] = n; });
+      parents.forEach(p => REGION_TERMS.add(p));
+    });
+  }
+  async function loadLearnedPlaces(){
+    try{
+      const r = await withTimeout(window.storage.get('geo_parents', true), 8000, 'Load');
+      applyLearnedPlaces(JSON.parse(r.value));
+    }catch(e){ /* nothing learned yet */ }
+  }
+  async function persistLearnedPlaces(entries){
+    try{
+      let current = {};
+      try{ current = JSON.parse((await withTimeout(window.storage.get('geo_parents', true), 6000, 'Load')).value) || {}; }catch(e){ current = {}; }
+      await withTimeout(window.storage.set('geo_parents', JSON.stringify({ ...current, ...entries }), true), 6000, 'Save');
+    }catch(e){ console.error('Could not save learned places', e); }
   }
 
   function renderFilterBar(){
@@ -753,9 +895,9 @@
       });
     });
 
-    const places = uniqueSorted([...direct]);
-    // Broader areas, widest first (USA, then California, then Southern California...)
-    const regions = [...terms].filter(t => !direct.has(t))
+    const places = uniqueSorted([...direct].filter(t => !REGION_TERMS.has(t)));
+    // Broader areas (countries, states, regions), widest first
+    const regions = [...terms].filter(t => REGION_TERMS.has(t))
       .sort((a, b) => (ancestorsOf(a).length - ancestorsOf(b).length) || a.localeCompare(b));
     const opt = (loc) => `<option value="${escapeHtml(loc)}" ${loc===filters.location?'selected':''}>${escapeHtml(loc)}</option>`;
     el('locationSelect').innerHTML = '<option value="">All locations</option>' +
@@ -770,10 +912,13 @@
     if (s){
       const hay = [v.name, v.contactName, v.notes, v.email, v.phone,
         (v.categories || []).join(' '), locationSearchText(v)].join(' ').toLowerCase();
-      if (!hay.includes(s)) return false;
+      // If what was typed is a known place or nickname ("la", "california", "socal"),
+      // also include vendors that serve that area through a broader tag.
+      const area = LOCATION_CANON[s];
+      if (!hay.includes(s) && !(area && vendorCoversArea(v, area))) return false;
     }
     if (filters.category && !(v.categories || []).includes(filters.category)) return false;
-    if (filters.location && !expandedLocationTerms(v).includes(filters.location)) return false;
+    if (filters.location && !vendorCoversArea(v, filters.location)) return false;
     return true;
   }
 
@@ -970,6 +1115,10 @@
             <div class="field">
               <label for="f-address">Address</label>
               <input type="text" id="f-address" value="${escapeHtml(v.address)}">
+              <div class="geo-row">
+                <button type="button" class="geo-btn" id="geoBtn">Detect location from address</button>
+                <span class="geo-status" id="geoStatus"></span>
+              </div>
             </div>
             <div class="field-row">
               <div class="field">
@@ -1074,22 +1223,28 @@
       if (i >= 0) selected.splice(i, 1); else selected.push(val);
       draw();
     });
-    function addTyped(){
-      const raw = input.value.trim();
-      if (!raw) return;
+    // Selects a value (adding it to the options if it's new). Returns true if it wasn't already selected.
+    function add(raw){
       const canon = canonicalize(raw);                      // "LA" -> "Los Angeles", "stone" -> "Stone"
       const existing = options.find(o => locKey(o) === locKey(canon));
       const val = existing || canon;
       if (!existing) options = uniqueSorted([...options, val]);
-      if (!selected.some(x => locKey(x) === locKey(val))) selected.push(val);
-      input.value = '';
+      const wasSelected = selected.some(x => locKey(x) === locKey(val));
+      if (!wasSelected) selected.push(val);
       draw();
+      return !wasSelected;
+    }
+    function addTyped(){
+      const raw = input.value.trim();
+      if (!raw) return;
+      add(raw);
+      input.value = '';
     }
     addBtn.addEventListener('click', addTyped);
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter'){ e.preventDefault(); addTyped(); } });
     draw();
     // Anything typed but not yet added still counts when the form is saved
-    return { getValues: () => { addTyped(); return [...selected]; } };
+    return { getValues: () => { addTyped(); return [...selected]; }, add };
   }
 
   function bindModal(){
@@ -1102,6 +1257,39 @@
       ALL_LOCATIONS.concat(...vendors.map(x => x.locations || [])),
       current ? (current.locations || []) : [],
       canonicalLocation, () => '#0E2841');
+
+    // Smart address: when the address is entered/changed (or the link is clicked), find the
+    // area and select it under Locations.
+    let pendingLookup = null;
+    async function runAddressLookup(){
+      const status = el('geoStatus');
+      const addr = el('f-address').value.trim();
+      if (!addr){ status.textContent = ''; return; }
+      status.textContent = 'Looking up location…';
+      const job = (async () => {
+        try{
+          const parsed = await geocodeAddress(addr);
+          if (!el('overlay')) return;                        // form was closed in the meantime
+          if (!parsed){ status.textContent = "Couldn't find that address, so pick the location below."; return; }
+          const r = resolveDetected(parsed);
+          if (!r.tag){ status.textContent = "Couldn't work out the area, so pick the location below."; return; }
+          if (Object.keys(r.learned).length){
+            applyLearnedPlaces(r.learned);
+            persistLearnedPlaces(r.learned);
+          }
+          const added = locPicker.add(r.tag);
+          status.innerHTML = `Detected <b>${escapeHtml(r.tag)}</b>${r.detail ? ' (' + escapeHtml(r.detail) + ')' : ''} · ${added ? 'added to Locations' : 'already selected'} · ` +
+            '<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap</a>';
+        }catch(e){
+          if (el('overlay')) status.textContent = "Location lookup isn't available right now, so pick the location below.";
+        }
+      })();
+      pendingLookup = job;
+      await job;
+      if (pendingLookup === job) pendingLookup = null;
+    }
+    el('f-address').addEventListener('change', runAddressLookup);
+    el('geoBtn').addEventListener('click', runAddressLookup);
 
     el('overlay').addEventListener('click', (e)=>{ if (e.target.id === 'overlay') closeModal(); });
     el('cancelBtn').addEventListener('click', closeModal);
@@ -1118,6 +1306,9 @@
       }
     });
     async function handleSave(){
+      if (pendingLookup){
+        await Promise.race([pendingLookup, new Promise(r => setTimeout(r, 5000))]);
+      }
       const categories = catPicker.getValues();
       const locations = locPicker.getValues();
       const data = {
